@@ -1,0 +1,1434 @@
+---
+title: "CoR documents - dataset creation and analysis"
+author: "Rusen Yasar & David Steinecke"
+date: '2022-05-18'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+library(skimr)
+library(tidyverse)
+library(rvest)
+library(glue)
+library(textreadr)
+library(lubridate)
+library(here)
+```
+
+We use a text file with an extract from an html file that contains the search results for all opinions and resolutions between 2010 and 2021. Each line of this text corrresponds to one CoR document. We use regex patterns to identify the information that we need: URL, doc title, name, type, CoR commission, rapporteur, adoption date.
+
+```{r}
+docsList <- readLines(here("data/input//docs2010to2021html.txt"), encoding="UTF-8")
+
+docsDF <- tibble(
+    docID = str_match(docsList, '(?<=class="metadata">)(.*?)(?=.doc)')[,2], 
+    docTitle = str_match(docsList, '.*class="subheader documenttitle wrap".*?>(.*?)(?=</a>)')[,2], 
+    docURL = str_match(docsList, '(?<=href=")(.*?)(?=")')[,2], 
+    docType = str_match(docsList, '(?<=<strong _ngcontent-pnj-c124="">)(.*?)(?=</strong>)')[,2], 
+    commission = str_match(docsList, '.*?<strong _ngcontent-pnj-c124="">.*?<strong _ngcontent-pnj-c124="">(.*?)(?=</strong>)')[,2], 
+    rapporteur = str_match(docsList, '.*?by\\s*<strong _ngcontent-pnj-c124="">(.*?)(?=</strong>)')[,2], 
+    adopDate = str_match(docsList, '.*?class="metadata ng-star-inserted">Adopted\\s*(.*?)\\s*(?=</)')[,2]
+)
+
+rm(docsList)
+
+```
+
+Inspection and cleaning:
+
+```{r}
+#glimpse(docsDF)
+#View(docsDF)
+
+# html code instead of white space:
+docsDF$commission <- str_replace(docsDF$commission, "amp;", "") 
+docsDF$rapporteur <- str_replace(docsDF$rapporteur, "amp;", "")
+# rapporteur name instead of commission:
+docsDF$commission[which(docsDF$commission=="LAMBERTZ" | 
+                          docsDF$commission=="BRESSO & VALCARCEL SISO")] <- "OTHER"
+# number instead of commission name:
+docsDF$commission[which(docsDF$commission=="12")] <- NA
+# commission name without term:
+docsDF$commissionSimple <- str_replace(docsDF$commission, "-.*", "")
+# for missing commission info for resolutions, define commission as RESOL:
+docsDF$commissionSimple[which(docsDF$docType=="RES")] <- "RESOL"
+# move commissionSimple next to commission:
+docsDF <- docsDF %>% 
+    relocate(commissionSimple, .after = commission)
+# convert variables from character to factor or date:
+docsDF$docType <- factor(docsDF$docType)
+docsDF$commission <- factor(docsDF$commission)
+docsDF$commissionSimple <- factor(docsDF$commissionSimple)
+docsDF$adopDate <- as.Date(docsDF$adopDate, "%d/%m/%Y")
+docsDF$adopYear <- format(docsDF$adopDate, format="%Y")
+
+#save(docsDF, file = here("data/cor_docs_basic_info.rdata"))
+#load(here("data/cor_docs_basic_info.rdata"))
+
+```
+
+We use the URLs to download the documents automatically. First, we download MS Word documents. But eventually we will use the pdf documents to build the dataset, so this step can be skipped.
+
+```{r}
+#doc_ID <- glue("{docsDF$docID}.docx")
+doc_ID <- str_remove_all(docsDF$docURL, "https://webapi2016.cor.europa.eu/v1/documents/") %>% 
+  str_remove_all("/content")
+dir.create(here("docs/word"))
+doc_ID <- paste0(here("docs/word"), "/", doc_ID)
+
+doc_URL <- docsDF$docURL
+
+safe_download <- safely(~ download.file(.x , .y, mode = "wb"))
+walk2(doc_URL, doc_ID, safe_download)
+
+```
+
+
+Next, we download the pdf documents; by replacing "content" at the end of the URL with "pdf", we can download the pdf versions. Some documents are missing from the database (on 19/05/2022, there were two missing documents): these have been manually generated from the MS Word documents and added to the directory.
+
+
+```{r}
+pdf_ID <- glue("{docsDF$docID}.pdf")
+dir.create(here("docs/pdf"))
+pdf_ID <- paste0(here("docs/pdf"), "/", pdf_ID)
+
+pdf_URL <- docsDF$docURL %>% 
+  str_replace_all("content", "pdf")
+
+safe_download <- safely(~ download.file(.x , .y, mode = "wb"))
+walk2(pdf_URL, pdf_ID, safe_download)
+```
+
+
+Reading content from the documents, using the pdf files: we group them by document name and collapse to one observation per document.
+
+```{r}
+text <- read_dir(here("docs/pdf")) %>% 
+  group_by(document) %>% 
+  summarise_all(~ str_c(., sep = "\n\n", collapse = "\n\n"))
+
+#save(text, file = here("data/opinions_resolutions.RData"))
+#load(here("data/opinions_resolutions.RData"))
+```
+
+
+Before we extract data from the content, some cleaning is necessary.
+
+We remove 14 documents because:
+* cor-2019-04970-00-01-ac-tra-en: neither opinion nor resolution
+* cor-2018-03891-00-00-ac-tra-en: same document in 11 languages
+* cdr175-2010_res_en: draft resolution (final resolution is cdr175-2010_fin_res_en)
+* cdr199-2010_res_en: Draft resolution (final resolution is cdr199-2010_fin_res_en)
+* cdr199-2010_rev1_res_en: Draft resolution (final resolution is cdr199-2010_fin_res_en)
+
+There are 8 duplicates that should be removed:
+
+* CIVEX-V-048
+* COTER-V-052
+* ECOS-V-056
+* ECOS-V-057
+* EDUC-V-043
+* NAT-V-039
+* NAT-V-042
+* NAT-V-044
+
+When removing different versions of the same document or duplicates, we opted for the newer versions.
+
+There are 3 cases with co-rapporteurs. This will make further coding difficult: e.g. co-rapporteurs can be from different parties, countries, etc. At this stage, we keep them and mark these cases, but the code for excluding them is ready below (commented).
+
+After this cleaning, we extract some basic information such as rapporteur, procedural basis, wordcount, simplified doc id.
+
+
+```{r}
+text1 <- text %>% 
+  mutate(language = str_extract(document, ".{2}$"),
+         draft = str_detect(content, "DRAFT RESOLUTION")) %>% 
+  filter(language == "en",
+         draft == FALSE,
+         document != "cor-2019-04970-00-01-ac-tra-en",   # not an opinion or resolution
+         document != "cor-2014-04459-00-00-ac-tra-en",   # double CIVEX-V-048
+         document != "cor-2014-04896-00-00-ac-tra-en",   # double COTER-V-052
+         document != "cor-2014-01344-00-00-ac-tra-en",   # double ECOS-V-056
+         document != "cor-2014-01319-00-00-ac-tra-en",   # double ECOS-V-057
+         document != "cor-2014-03921-00-00-ac-tra-en",   # double EDUC-V-043
+         document != "cor-2014-04832-00-01-ac-tra-en",   # double NAT-V-039
+         document != "cor-2014-02646-00-00-ac-tra-en",   # double NAT-V-042
+         document != "cor-2014-04835-00-00-ac-tra-en",   # double NAT-V-044
+         #document != "cdr318-2010_fin_ac_en",           # exclude case with 2 rapporteurs
+         #document != "cor-2018-01230-00-01-ac-tra-en",  # exclude case with 2 rapporteurs
+         #document != "cor-2018-03593-00-00-ac-tra-en"   # exclude case with 2 rapporteurs
+         ) %>% select(-c(3,4)) %>% 
+  mutate(rap = str_extract(content, regex('(?<=Rapporteur).*', 
+                                     dotall = TRUE)) %>% str_replace_all("\\s+", " ") %>%
+           str_remove_all("Reference.*") %>% trimws() %>%
+           str_remove_all("CdR.*") %>%
+           str_remove_all("COR.*") %>%
+           str_remove_all("CDR.*") %>%
+           str_remove_all("__.*") %>%
+           str_remove_all("Analysis.*") %>%
+           str_remove_all("^Rapporteur") %>%
+           str_remove_all("^- General") %>%
+           str_remove_all("^-General") %>%
+           str_remove_all("^-general") %>%
+           str_remove_all("^:") %>%
+           str_remove_all("^s") %>% trimws() %>%
+           str_remove_all("^Mrs") %>%
+           str_remove_all("^Mr") %>%
+           str_remove_all("^Ms") %>%
+           str_remove_all("^Councillor") %>%
+           str_remove_all("^Cllr\\.") %>%
+           str_remove_all("^Cllr") %>% trimws() %>% 
+           ifelse(str_detect(., "Alain Hutchinson"), 
+                  "Alain Hutchinson (BE/PES), Member of the Brussels-Capital Regional Parliament", .) %>% 
+           ifelse(str_detect(., "Lotta Håkansson Harju"), 
+                  "Lotta Håkansson Harju (PES/SE), Member of Järfälla Municipal Council", .) %>%
+           ifelse(str_detect(., "Tadeusz Truskolaski"), 
+                  "Tadeusz Truskolaski (PL/EA), Mayor of Białystok", .) %>%
+           ifelse(str_detect(., "Juan Espadas Cejas"), 
+                  "Juan Espadas Cejas (ES/PES), Member of a Local Executive: Seville Municipal Council", .) %>%
+           ifelse(str_detect(., "Mark Speich"), 
+                  "Mark Speich (DE/EPP), Secretary of State for Federal, European and International Affairs (North Rhine-Westphalia)", .) %>%
+           ifelse(document == "cor-2018-03593-00-00-ac-tra-en", 
+                  "Catiuscia Marini (IT/PES) President of the Umbria Region and Michael Schneider (DE/EPP) State Secretary, Representative of the Land of Saxony-Anhalt to the Federal Government", .),
+         co_raps = case_when(document == "cdr318-2010_fin_ac_en" ~ 1,
+                             document == "cor-2018-01230-00-01-ac-tra-en" ~ 1,
+                             document == "cor-2018-03593-00-00-ac-tra-en" ~ 1,
+                             TRUE ~ 0),
+         last_page = str_extract(content, regex("PROCEDURE.*", 
+                                     dotall = TRUE)),
+         proc_basis = str_replace_all(last_page, "\\s+", " ") %>% 
+           str_extract_all("(?<=Procedural basis).*") %>% as.character() %>% 
+           str_remove_all("\\Date.*") %>% trimws() %>% 
+           str_remove_all("\\Council referral.*") %>%
+           str_remove_all("\\Data of Council.*") %>%
+           str_remove_all("\\Commission letter.*") %>%
+           str_remove_all("\\Future Belgian presidency letter.*") %>%
+           str_remove_all("\\Legal basis.*") %>%
+           str_remove("Optional referral 7 May 2018") %>% trimws() %>%
+           ifelse(nchar(.) <= 3, NA, .) %>%
+           ifelse(. == "character(0)", NA, .),
+         wordcount = str_count(content,'\\w+'),
+         id = str_remove_all(content, "\\n.*") %>% 
+           ifelse(document == "cdr255-2009_fin_ac_en", "COTER-V-002", .),
+         id_com = ifelse(nchar(id) > 13, NA, id) %>%
+           ifelse(. == "RESOLUTION", NA, .) %>% 
+           ifelse(. == "EUDC-V-025", "EDUC-V-025", .) %>% 
+           str_replace_all("\\/", "\\-") %>% 
+           str_replace_all("\\-\\s+", "-") %>%
+           str_replace_all("\\s+", "-") %>% 
+           str_remove_all("\\d"),
+         id_num = ifelse(nchar(id) > 13, NA, id) %>%
+           str_remove_all("\\D") %>% 
+           ifelse(nchar(.) < 3, str_glue("0{.}"), .),
+         id_clean = str_glue("{id_com}{id_num}", .na = NULL) %>% as.character(),
+         id_clean = case_when(document == "cdr101-2010_fin_res_en" ~ "RESOL-?-001",
+                              document == "cdr1031-2012_fin_res_en" ~ "RESOL-?-002",
+                              document == "cdr123-2011_fin_res_en" ~ "RESOL-?-003",
+                              document == "cdr156-2011_fin_res_en" ~ "RESOL-?-004",
+                              document == "cdr175-2010_fin_res_en" ~ "RESOL-?-005",
+                              document == "cdr199-2010_fin_res_en" ~ "RESOL-?-006",
+                              document == "cdr269-2011_fin_res_en" ~ "RESOL-?-007",
+                              document == "cdr284-2010_fin_res_en" ~ "RESOL-?-008",
+                              document == "cdr361-2010_fin_res_en" ~ "RESOL-?-010",
+                              document == "cdr361-2011_fin_res_en" ~ "RESOL-?-011",
+                              document == "cdr42-2012_fin_res_en" ~ "RESOL-?-012",
+                              document == "cdr84-2012_fin_res_en" ~ "RESOL-?-013",
+                              document == "cdr318-2010_fin_ac_en" ~ "OP-?-001",
+                              document == "r_cdr137-2010_fin_res_en" ~ "RECOM-?-001",
+                              TRUE ~ id_clean)) %>% select(-c(9:10))
+```
+
+
+In addition to wordcount, we also count articles as an alternative measurement of document length. 
+
+For 11 documents, automated counting was not possible due to unreadability or unavailability of the article numbering. These are hand-coded:
+
+* cdr4129-2013_00_00_tra_res_en: 21
+* cor-2015-03636-00-00-ac-tra-en: 46
+* cor-2016-01411-00-03-ac-tra-en: 55
+* cor-2017-01982-00-00-ac-tra-en: 34
+* cor-2017-04391-00-00-res-tra-en: 36
+* cor-2018-00924-00-00-ac-tra-en: 25
+* cor-2018-02515-00-00-ac-tra-en: 44
+* cor-2019-03195-00-00-ac-tra-en: 44
+* cor-2019-04351-00-00-res-tra-en: 67
+* cor-2019-04829-00-01-ac-tra-en: 44
+* cor-2020-02016-00-01-ac-tra-en: 54
+
+In 9 cases, sub-articles should be counted for an adequate measurement:
+
+* cor-2014-02333-00-00-res-tra-en
+* cor-2014-02332-00-00-res-tra-en
+* cor-2017-05782-00-00-ac-tra-en
+* cor-2017-01791-00-01-res-tra-en
+* cdr87-2012_fin_ac_en
+* cdr199-2010_fin_res_en
+* cor-2014-00672-00-00-ac-tra-en
+* cor-2019-02727-00-00-ac-tra-en
+* cor-2017-03197-00-01-ac-tra-en
+
+```{r}
+articles <- text1 %>% select(1,2) %>% 
+  mutate(n_articles = str_extract_all(content, "\\n\\n\\d+\\.\\s+")) %>%
+  unnest_longer(n_articles) %>% 
+  mutate(n_articles = n_articles %>% str_extract_all("\\d+") %>% as.numeric()) %>%
+  group_by(document) %>%
+  slice_max(n_articles) %>% 
+  ungroup()
+
+sub_articles <- text1 %>% select(1,2) %>% 
+  mutate(n_articles = str_extract_all(content, "\\n\\n\\d+\\.\\d+\\s+")) %>%
+  unnest_longer(n_articles) %>% 
+  mutate(n_articles = n_articles %>% str_extract_all("\\d+\\.\\d+")) %>%
+  group_by(document) %>%
+  mutate(n_sub_articles = row_number()) %>%
+  slice_max(n_sub_articles) %>% 
+  ungroup() %>% 
+  mutate(n_sub_articles = if_else(n_sub_articles == 1, NA_integer_, n_sub_articles)) %>% 
+  select(1,4)
+
+text_art <- text1 %>% left_join(articles %>% select(1,3), by = "document") %>% 
+  mutate(n_articles = case_when(document == "cdr4129-2013_00_00_tra_res_en" ~ 21,
+                                 document == "cor-2015-03636-00-00-ac-tra-en" ~ 46,
+                                 document == "cor-2016-01411-00-03-ac-tra-en" ~ 55,
+                                 document == "cor-2017-01982-00-00-ac-tra-en" ~ 34,
+                                 document == "cor-2017-04391-00-00-res-tra-en" ~ 36,
+                                 document == "cor-2018-00924-00-00-ac-tra-en" ~ 25,
+                                 document == "cor-2018-02515-00-00-ac-tra-en" ~ 44,
+                                 document == "cor-2019-03195-00-00-ac-tra-en" ~ 44,
+                                 document == "cor-2019-04351-00-00-res-tra-en" ~ 67,
+                                 document == "cor-2019-04829-00-01-ac-tra-en" ~ 44,
+                                 document == "cor-2020-02016-00-01-ac-tra-en" ~ 54,
+                                 TRUE ~ n_articles)) %>% 
+  left_join(sub_articles, by = "document") %>% 
+  rowwise() %>% 
+  mutate(n_articles_total = sum(n_articles, n_sub_articles, na.rm = TRUE)) %>% 
+  ungroup()
+```
+
+
+There are important differences betwen opinions and resolutions. Normally resolutions don't have a rapporteur, their topic cannot be classified based on drafting commission, etc. Opinions will provide more information that will be useful for further analysis. So we process them separaly here.
+
+For opinions, we extract several types of rapporteur-related information: their political party, country, constituency, etc. We try to determine whether their constituency is local or regional, but qualitative judgment will be necessary for a more accurate coding.
+
+```{r}
+resolutions <- text_art %>% filter(str_detect(document, "res")) %>% 
+  mutate(vote = str_extract_all(content,'(?<=Result of the vote in commission).*') %>% 
+           trimws() %>% ifelse(. == "character(0)", NA, .),
+         rap = ifelse(document != "cdr2233-2012_00_00_tra_res_en", NA_character_, rap)) %>%
+  select(-c(2, 5))
+         
+  
+opinions <- text_art %>% filter(str_detect(document, "ac")) %>% 
+  mutate(rap_info = str_extract(rap, "(?<=\\().*(?=\\))"),
+         rapporteur = str_remove(rap, "(?:\\(|\\,).*") %>% trimws(),
+         rapporteur = case_when(rapporteur == "J.F.M." ~ "J.F.M. (Hans) Janssen",
+                                rapporteur == "P.G." ~ "P.G. (Piet) de Vey Mestdagh",
+                                TRUE ~ rapporteur),
+         party = case_when(str_detect(rap_info, "ALDE") ~ "ALDE",
+                           str_detect(rap_info, "ADLE") ~ "ALDE",
+                           str_detect(rap_info, "EA") ~ "EA",
+                           str_detect(rap_info, "EPP") ~ "EPP",
+                           str_detect(rap_info, "PPE") ~ "EPP",
+                           str_detect(rap_info, "PES") ~ "PES",
+                           str_detect(rap_info, "PSE") ~ "PES",
+                           str_detect(rap_info, "Renew E.") ~ "RE",
+                           str_detect(rap_info, "Renew Europe") ~ "RE",
+                           str_detect(rap_info, "RE") ~ "RE",
+                           str_detect(rap_info, "ECR") ~ "ECR",
+                           str_detect(rap_info, "NI") ~ "NI"),
+         country = case_when(str_detect(rap_info, "AT") ~ "AT",
+                             str_detect(rap_info, "BE") ~ "BE",
+                             str_detect(rap_info, "BG") ~ "BG",
+                             str_detect(rap_info, "CZ") ~ "CZ",
+                             str_detect(rap_info, "CS") ~ "CZ",
+                             str_detect(rap_info, "/DE") ~ "DE",
+                             str_detect(rap_info, "DE/") ~ "DE",
+                             str_detect(rap_info, "DK") ~ "DK",
+                             str_detect(rap_info, "EE") ~ "EE",
+                             str_detect(rap_info, "EL") ~ "EL",
+                             str_detect(rap_info, "/ES") ~ "ES",
+                             str_detect(rap_info, "^ES") ~ "ES",
+                             str_detect(rap_info, "FI") ~ "FI",
+                             str_detect(rap_info, "FR") ~ "FR",
+                             str_detect(rap_info, "HR") ~ "HR",
+                             str_detect(rap_info, "Croatia") ~ "HR",
+                             str_detect(rap_info, "HU") ~ "HU",
+                             str_detect(rap_info, "IE") ~ "IE",
+                             str_detect(rap_info, "IT") ~ "IT",
+                             str_detect(rap_info, "LT") ~ "LT",
+                             str_detect(rap_info, "LU") ~ "LU",
+                             str_detect(rap_info, "LV") ~ "LV",
+                             str_detect(rap_info, "MT") ~ "MT",
+                             str_detect(rap_info, "NL") ~ "NL",
+                             str_detect(rap_info, "PL") ~ "PL",
+                             str_detect(rap_info, "PT") ~ "PT",
+                             str_detect(rap_info, "RO") ~ "RO",
+                             str_detect(rap_info, "/SE") ~ "SE",
+                             str_detect(rap_info, "SE/") ~ "SE",
+                             str_detect(rap_info, "SI") ~ "SI",
+                             str_detect(rap_info, "SK") ~ "SK",
+                             str_detect(rap_info, "SL") ~ "SL",
+                             str_detect(rap_info, "UK") ~ "UK"),
+         occupation1 = str_extract(rap, "(?<=\\)).*") %>% 
+           str_remove(",") %>% trimws() %>% ifelse(nchar(.) <= 8, NA, .),
+         occupation2 = str_extract(rap, "(?<=,).*(?=\\()") %>% 
+           str_remove(",") %>% trimws(),
+         occupation = ifelse(is.na(occupation1), occupation2, occupation1) %>% 
+           str_remove("Janssen (NL/EPP) ") %>% str_remove("de Vey Mestdagh (NL/ALDE) "),
+         occupation_low = str_to_lower(occupation),
+         local = case_when(str_detect(occupation_low, "city") ~ "local",
+                           str_detect(occupation_low, "municipal") ~ "local",
+                           str_detect(occupation_low, "mayor") ~ "local",
+                           str_detect(occupation_low, "local") ~ "local",
+                           str_detect(occupation_low, "county") ~ "local",
+                           str_detect(occupation_low, "district") ~ "local"),
+         regional = case_when(str_detect(occupation_low, "region") ~ "regional",
+                              str_detect(occupation_low, "community") ~ "regional",
+                              str_detect(occupation_low, "land") ~ "regional",
+                              str_detect(occupation_low, "state") ~ "regional",
+                              str_detect(occupation_low, "nation") ~ "regional",
+                              str_detect(occupation_low, "provinc") ~ "regional",
+                              str_detect(occupation_low, "parliament") ~ "regional"),
+         loc_reg = case_when(!is.na(local) & is.na(regional) ~ "local",
+                             is.na(local) & !is.na(regional) ~ "regional",
+                             !is.na(local) & !is.na(regional) ~ "mixed",
+                             is.na(local) & is.na(regional) ~ NA_character_))
+```
+
+For manual coding of local/regional unit, we export the opinions table as csv:
+
+```{r}
+opinions %>%
+    select(document, rap, id_clean, rap_info, rapporteur, party, country, 
+           occupation, occupation1, occupation2, occupation_low, 
+           local, regional, loc_reg) %>% 
+    write_excel_csv(file = here("data/output/opinions_raps.csv"))
+```
+
+
+We extract the result of the vote in the commission drafting the opinion. This can be achieved by looking at the last page, and finding where the vote result is given. In some cases, this procedure does not work, either because there is no row in table dedicated to vote results or because table does not explicitly state that it is the commission vote. Such cases are hand-coded are left blank.
+
+No row in table dedicated to vote results:
+* cdr1777-2012_00_00_tra_ac_en
+* cdr56-2012_fin_ac_en
+* cor-2018-02837-00-00-ac-tra-en
+* cor-2018-02839-00-01-ac-tra-en
+* cor-2018-02906-00-00-ac-tra-en
+* cor-2018-03660-00-00-ac-tra-en
+
+Table does not explicitly state that it is the commission vote:
+* cdr163-2011_fin_ac_en
+* cdr197-2011_fin_ac_en
+* cdr20-2010_fin_ac_en
+* cdr210-2009_fin_ac_en
+* cdr235-2010_fin_ac_en
+* cor-2015-02671-00-02-ac-tra-en
+* cor-2020-00840-00-00-ac-tra-en
+
+```{r}
+opinions <- opinions %>% 
+  mutate(vote1 = str_extract_all(last_page,'(?<=Result of the vote in commission).*') %>% 
+           trimws(),
+         vote2 = str_extract_all(last_page,'(?<=Result of the vote in the Commission).*') %>% 
+           trimws() %>%
+           ifelse(. == "character(0)", NA, .),
+         vote3 = str_extract_all(last_page,'(?<=Result of vote in commission).*') %>% 
+           trimws() %>%
+           ifelse(. == "character(0)", NA, .),
+         vote4 = str_extract_all(last_page,'(?<=Result of the commission vote).*') %>% 
+           trimws() %>%
+           ifelse(. == "character(0)", NA, .),
+         vote5 = str_extract_all(last_page,'(?<=Result of voting in the Commission).*') %>% 
+           trimws() %>%
+           ifelse(. == "character(0)", NA, .),
+         vote6 = str_extract_all(last_page,'(?<=Result of the vote).*') %>% 
+           trimws() %>%
+           ifelse(. == "character(0)", NA, .),
+         vote7 = str_extract_all(last_page,'(?<=Vote outcome).*') %>% 
+           trimws() %>%
+           ifelse(. == "character(0)", NA, .),
+         vote8 = str_extract_all(last_page,'(?<=Result of vote).*') %>% 
+           trimws() %>%
+           ifelse(. == "character(0)", NA, .),
+         vote_com = case_when(vote1 == "character(0)" & !is.na(vote2) ~ vote2,
+                              vote1 == "character(0)" & !is.na(vote3) ~ vote3,
+                              vote1 == "character(0)" & !is.na(vote4) ~ vote4,
+                              vote1 == "character(0)" & !is.na(vote5) ~ vote5,
+                              TRUE ~ vote1) %>% 
+           ifelse(. == "character(0)", NA, .) %>% 
+           ifelse(document == "cor-2020-01373-00-00-ac-tra-en", "Majority", .) %>% 
+           ifelse(document == "cor-2020-03319-00-02-ac-tra-en", "unanimous", .) %>% 
+           ifelse(document == "cdr240-2013_00_00_tra_ac_en", "Unanimous", .) %>% 
+           ifelse(document == "cor-2015-06628-00-01-ac-tra-en", "By a majority", .) %>% 
+           ifelse(document == "cdr3303-2013_00_00_tra_ac_en", "Majority", .) %>% 
+           ifelse(document == "cor-2018-03952-00-00-ac-tra-en", "n/a", .) %>% 
+           ifelse(document == "cor-2018-04106-00-02-ac-tra-en", "-", .) %>% 
+           ifelse(document == "cor-2015-01426-00-00-ac-tra-en", "Unanimous", .),
+         vote_all = case_when(is.na(vote_com) & !is.na(vote6) ~ vote6,
+                              is.na(vote_com) & !is.na(vote7) ~ vote7,
+                              is.na(vote_com) & !is.na(vote8) ~ vote8,
+                              TRUE ~ vote_com) %>% 
+           ifelse(document == "cor-2020-00840-00-00-ac-tra-en", "Unanimity", .),
+         vote_com_clean = case_when(str_detect(vote_com, "ajority") ~ "majority",
+                                 str_detect(vote_com, "nanim") ~ "unanimity"),
+         vote_all_clean = case_when(str_detect(vote_all, "ajority") ~ "majority",
+                                 str_detect(vote_all, "nanim") ~ "unanimity")) %>% 
+  select(1, 6:7, 9:12, 4, 14:16, 19, 23, 34:35)
+```
+
+
+Next, we calculate the length of procedure. We find the first available date after the procedural basis in the table on the last page (assuming this is the earliest known date when the procedure began), and calculate the duration from this date until the date of adoption in days.
+
+```{r}
+start_date <- text1 %>% 
+  filter(str_detect(document, "ac")) %>% 
+  select(-c(3,4)) %>% 
+  mutate(last_page = str_extract(content, regex("(?:Procedural basis|Procedural process|Procedure\\s{2,}).*(?:Date adopted in plenary|Adopted in plenary|Date adopted by plenary|Date of adoption by the plenary session|Date of adoption in plenary|Adopted at plenary|Date adoption in plenary|Date of adoption by plenary session|Adoption in plenary|Date adopted plenary)", 
+                                     dotall = TRUE)) %>% 
+           ifelse(document == "cor-2017-02776-00-00-ac-tra-en" |
+                    document == "cor-2018-03653-00-00-ac-tra-en" |
+                    document == "cor-2017-01036-00-00-ac-tra-en", 
+                  str_extract(content, 
+                              regex("PROCEDURE.*Date adopted in plenary", dotall = TRUE)), .),
+         start_date1 = str_extract(last_page, regex("
+         (\\d{1,2})      # one or two numbers
+         (\\s+)?         # optional whitespace
+         (?:January|February|March|April|May|June|July|August|September|October|November|December)
+         (\\s+)?         # optional whitespace
+         (\\d{4})      # four numbers
+         ", comments = TRUE)),
+         start_date2 = str_extract(last_page, regex("
+         (\\d{1,2})      # one or two numbers
+         (\\s+)?         # optional whitespace
+         (?:\\.|\\/)  # optional dash or slash or long dash
+         (\\s+)?         # optional whitespace
+         (\\d{1,2})
+         (\\s+)?         # optional whitespace
+         (?:\\.|\\/)  # optional dash or slash or long dash
+         (\\s+)?         # optional whitespace
+         (\\d{4})      # four numbers
+         ", comments = TRUE)),
+         start_date3 = start_date1 %>% trimws() %>% dmy(),
+         start_date4 = start_date2 %>% trimws() %>% dmy(),
+         start = case_when(start_date3 <= start_date4 | is.na(start_date4) ~ start_date3,
+                           start_date4 < start_date3 | is.na(start_date3) ~ start_date4))
+
+t_procedure <- start_date %>% 
+  left_join(docsDF %>% select(1, 8), by = c("document" = "docID")) %>% 
+  mutate(duration = interval(start, adopDate) / days(1)) %>% 
+  select(1, 4:5, 7, 12:14)
+```
+
+
+Impact reports are available yearly since 2010. We downloaded them manually and put them into a sub-directory. We import them here from this sub-directory, but the report for 2017 does not work with the function read_dir, so we use read_pdf separately for it.
+
+```{r}
+reports <- read_dir(here("docs/impact_reports/pdf")) %>% 
+  group_by(document) %>% 
+  summarise_all(~ str_c(., sep = "\n\n", collapse = "\n\n")) 
+```
+
+
+We prepare the reports for automated searching, considering reports contain lists of cited opinions, opinions with impact, adopted opinions, etc.
+
+```{r}
+reports1 <- reports %>% 
+  mutate(content1 = str_remove(content, "List of opinions included in this report") %>% 
+           str_remove("List of CoR opinions with impact") %>% 
+           str_remove("List of adopted CoR opinions") %>% 
+           str_remove("List of opinions adopted"),
+         content_11 = str_remove_all(content1, 
+                                     regex('(?<=List of adopted CoR opinions).*(?=Appendix 2)',
+                                           dotall = TRUE)),
+         list_12_16 = str_extract(content1, 
+                                  regex('(?<=List of CoR opinions with impact).*', 
+                                        dotall = TRUE)) %>% trimws() %>% 
+           str_remove_all("(?<=\\[).*"),
+         list_17_19 = str_extract(content1, 
+                                  regex('(?<=List of opinions included in this report).*(?=List of opinions adopted)',
+                                      dotall = TRUE)) %>% trimws(),
+         content_17_19 = str_remove_all(content1, 
+                                        regex('(?<=List of opinions adopted).*(?=Meetings in)',
+                                              dotall = TRUE))) %>% 
+  arrange(document)
+```
+
+
+Then we run a variety of searches: doc ids and titles within lists and content. These separate measurements will need to be combined later.
+
+id and title within lists:
+
+```{r}
+# search id within lists
+
+impact_id_old <- text1 %>% 
+  left_join(docsDF, by = c("document" = "docID")) %>% select(-c(2:8, 11:17)) %>% 
+  mutate(impact_10 = str_count(reports1$content[1], id_clean),
+         impact_11 = str_count(reports1$content_11[2], id_clean),
+         impact_12 = str_count(reports1$list_12_16[3], id_clean),
+         impact_13 = str_count(reports1$list_12_16[4], id_clean),
+         impact_14 = str_count(reports1$list_12_16[5], id_clean),
+         impact_15 = str_count(reports1$list_12_16[6], id_clean),
+         impact_16 = str_count(reports1$list_12_16[7], id_clean),
+         impact_17 = str_count(reports1$list_17_19[8], id_clean),
+         impact_18 = str_count(reports1$list_17_19[9], id_clean),
+         impact_19 = str_count(reports1$list_17_19[10], id_clean))
+
+
+# search title within lists
+
+impact_title_old <- text1 %>% 
+  left_join(docsDF, by = c("document" = "docID")) %>% select(-c(2:8, 11:17)) %>% 
+  mutate(docTitle = ifelse(document == "cor-2018-01019-00-00-ac-tra-en", 
+                           "Contribution of EU local and regional authorities to the 14th meeting of the Conference of the Parties to the Convention on Biological Diversity (CBD)", docTitle),
+         impact_101 = str_count(reports1$content[1], docTitle),
+         impact_111 = str_count(reports1$content_11[2], docTitle),
+         impact_121 = str_count(reports1$list_12_16[3], docTitle),
+         impact_131 = str_count(reports1$list_12_16[4], docTitle),
+         impact_141 = str_count(reports1$list_12_16[5], docTitle),
+         impact_151 = str_count(reports1$list_12_16[6], docTitle),
+         impact_161 = str_count(reports1$list_12_16[7], docTitle),
+         impact_171 = str_count(reports1$list_17_19[8], docTitle),
+         impact_181 = str_count(reports1$list_17_19[9], docTitle),
+         impact_191 = str_count(reports1$list_17_19[10], docTitle)) 
+```
+
+
+id within content
+
+```{r}
+impact_id <- text1 %>% 
+  left_join(docsDF, by = c("document" = "docID")) %>% select(1, 8:10) %>% 
+  mutate(impact_10 = str_count(reports1$content[1], id_clean),
+         impact_11 = str_count(reports1$content_11[2], id_clean),
+         impact_12 = str_count(reports1$content[3], id_clean),
+         impact_13 = str_count(reports1$content[4], id_clean),
+         impact_14 = str_count(reports1$content[5], id_clean),
+         impact_15 = str_count(reports1$content[6], id_clean),
+         impact_16 = str_count(reports1$content[7], id_clean),
+         impact_17 = str_count(reports1$content_17_19[8], id_clean),
+         impact_18 = str_count(reports1$content_17_19[9], id_clean),
+         impact_19 = str_count(reports1$content_17_19[10], id_clean))
+
+impact_id_sd <- text1 %>% 
+  left_join(docsDF, by = c("document" = "docID")) %>% select(1, 8:10) %>% 
+  mutate(id_num = str_remove_all(id_clean, "\\D") %>% 
+           ifelse(nchar(.) < 3, str_glue("0{.}"), .),
+         id_com = str_remove_all(id_clean, "\\d") %>% 
+           str_remove_all(".$") %>% 
+           str_replace_all("\\/", "\\-") %>% 
+           str_replace_all("- ", "-") %>% 
+           str_replace_all(" ", "-"),
+         id_slash = str_glue("{id_com}/{id_num}", .na = NULL),
+         id_dash = str_glue("{id_com}-{id_num}", .na = NULL),
+         imp_10_slash = str_count(reports1$content[1], id_slash),
+         imp_10_dash = str_count(reports1$content[1], id_dash),
+         imp_11_slash = str_count(reports1$content_11[2], id_slash),
+         imp_11_dash = str_count(reports1$content_11[2], id_dash),
+         imp_12_slash = str_count(reports1$content[3], id_slash),
+         imp_12_dash = str_count(reports1$content[3], id_dash),
+         imp_13_slash = str_count(reports1$content[4], id_slash),
+         imp_13_dash = str_count(reports1$content[4], id_dash),
+         imp_14_slash = str_count(reports1$content[5], id_slash),
+         imp_14_dash = str_count(reports1$content[5], id_dash),
+         imp_15_slash = str_count(reports1$content[6], id_slash),
+         imp_15_dash = str_count(reports1$content[6], id_dash),
+         imp_16_slash = str_count(reports1$content[7], id_slash),
+         imp_16_dash = str_count(reports1$content[7], id_dash),
+         imp_17_slash = str_count(reports1$content_17_19[8], id_slash),
+         imp_17_dash = str_count(reports1$content_17_19[8], id_dash),
+         imp_18_slash = str_count(reports1$content_17_19[9], id_slash),
+         imp_18_dash = str_count(reports1$content_17_19[9], id_dash),
+         imp_19_slash = str_count(reports1$content_17_19[10], id_slash),
+         imp_19_dash = str_count(reports1$content_17_19[10], id_dash),
+         impact_10 = imp_10_slash + imp_10_dash,
+         impact_11 = imp_11_slash + imp_11_dash,
+         impact_12 = imp_12_slash + imp_12_dash,
+         impact_13 = imp_13_slash + imp_13_dash,
+         impact_14 = imp_14_slash + imp_14_dash,
+         impact_15 = imp_15_slash + imp_15_dash,
+         impact_16 = imp_16_slash + imp_16_dash,
+         impact_17 = imp_17_slash + imp_17_dash,
+         impact_18 = imp_18_slash + imp_18_dash,
+         impact_19 = imp_19_slash + imp_19_dash,
+         impact = impact_10 + impact_11 + impact_12 + impact_13 + impact_14 +
+           impact_15 + impact_16 + impact_17 + impact_18 + impact_19)
+```
+
+
+title within content
+
+```{r}
+reports_lower <- reports1 %>% 
+  mutate(content = content %>% str_to_lower(),
+         content_11 = content_11 %>% str_to_lower(),
+         content_17_19 = content_17_19 %>% str_to_lower())
+
+impact_title <- text1 %>% 
+  left_join(docsDF, by = c("document" = "docID")) %>% select(1, 8:10) %>% 
+  mutate(title_clean = str_remove_all(docTitle, "AC-") %>%
+           str_remove_all("AC -") %>%
+           str_remove_all("AC ") %>%
+           str_remove_all("AC:") %>% 
+           str_remove_all("- AC") %>%
+           str_remove_all(id) %>%
+           str_remove_all("ATT DOC SD") %>% 
+           str_remove_all("^ -") %>%
+           str_remove_all("_RESOL-002_Final_") %>%
+           str_remove_all("resol-V-008_") %>%
+           str_remove_all("_REV_01") %>%
+           str_remove_all("resol-V-006:") %>%
+           str_remove_all("RESOL-V-013 -") %>%
+           str_remove_all("Rapporteur: R. Ciambetti") %>%
+           str_replace_all("_", " ") %>%
+           trimws() %>% 
+           str_to_title(.) %>% 
+           ifelse(document == "cor-2018-01019-00-00-ac-tra-en", 
+                           "Contribution of EU local and regional authorities to the 14th meeting of the Conference of the Parties to the Convention on Biological Diversity (CBD)", .)%>% 
+           ifelse(document == "cor-2016-02419-00-02-ac-tra-en", 
+                           "Action Plan on VAT - Towards a single EU VAT area", .),
+         title_lower = title_clean %>% str_to_lower(),
+         title_nb = str_remove_all(title_lower, "\\(.*\\)") %>%
+           trimws(),
+         imp_10_nb = str_count(reports_lower$content[1], title_nb),
+         imp_10_b = str_count(reports_lower$content[1], title_lower),
+         imp_11_nb = str_count(reports_lower$content_11[2], title_nb),
+         imp_11_b = str_count(reports_lower$content_11[2], title_lower),
+         imp_12_nb = str_count(reports_lower$content[3], title_nb),
+         imp_12_b = str_count(reports_lower$content[3], title_lower),
+         imp_13_nb = str_count(reports_lower$content[4], title_nb),
+         imp_13_b = str_count(reports_lower$content[4], title_lower),
+         imp_14_nb = str_count(reports_lower$content[5], title_nb),
+         imp_14_b = str_count(reports_lower$content[5], title_lower),
+         imp_15_nb = str_count(reports_lower$content[6], title_nb),
+         imp_15_b = str_count(reports_lower$content[6], title_lower),
+         imp_16_nb = str_count(reports_lower$content[7], title_nb),
+         imp_16_b = str_count(reports_lower$content[7], title_lower),
+         imp_17_nb = str_count(reports_lower$content_17_19[8], title_nb),
+         imp_17_b = str_count(reports_lower$content_17_19[8], title_lower),
+         imp_18_nb = str_count(reports_lower$content_17_19[9], title_nb),
+         imp_18_b = str_count(reports_lower$content_17_19[9], title_lower),
+         imp_19_nb = str_count(reports_lower$content_17_19[10], title_nb),
+         imp_19_b = str_count(reports_lower$content_17_19[10], title_lower),
+         impact_10 = ifelse(imp_10_b == 0 & imp_10_nb != 0, imp_10_nb, imp_10_b),
+         impact_11 = ifelse(imp_11_b == 0 & imp_11_nb != 0, imp_11_nb, imp_11_b),
+         impact_12 = ifelse(imp_12_b == 0 & imp_12_nb != 0, imp_12_nb, imp_12_b),
+         impact_13 = ifelse(imp_13_b == 0 & imp_13_nb != 0, imp_13_nb, imp_13_b),
+         impact_14 = ifelse(imp_14_b == 0 & imp_14_nb != 0, imp_14_nb, imp_14_b),
+         impact_15 = ifelse(imp_15_b == 0 & imp_15_nb != 0, imp_15_nb, imp_15_b),
+         impact_16 = ifelse(imp_16_b == 0 & imp_16_nb != 0, imp_16_nb, imp_16_b),
+         impact_17 = ifelse(imp_17_b == 0 & imp_17_nb != 0, imp_17_nb, imp_17_b),
+         impact_18 = ifelse(imp_18_b == 0 & imp_18_nb != 0, imp_18_nb, imp_18_b),
+         impact_19 = ifelse(imp_19_b == 0 & imp_19_nb != 0, imp_19_nb, imp_19_b),
+         impact = impact_10 + impact_11 + impact_12 + impact_13 + impact_14 +
+           impact_15 + impact_16 + impact_17 + impact_18 + impact_19)
+```
+
+
+doc_id within content
+
+```{r}
+impact_doc_id_old <- text1 %>% 
+  left_join(docsDF, by = c("document" = "docID")) %>% select(1, 8:10) %>% 
+  mutate(docTitle = ifelse(document == "cor-2018-01019-00-00-ac-tra-en", 
+                           "Contribution of EU local and regional authorities to the 14th meeting of the Conference of the Parties to the Convention on Biological Diversity (CBD)", docTitle),
+         doc_id = str_remove_all(document, "^r_") %>%
+           str_remove_all("_.*") %>% 
+           str_replace_all("cdr", "CdR "),
+         impact_101 = str_count(reports1$content[1], doc_id),
+         impact_111 = str_count(reports1$content_11[2], doc_id),
+         impact_121 = str_count(reports1$content[3], doc_id),
+         impact_131 = str_count(reports1$content[4], doc_id),
+         impact_141 = str_count(reports1$content[5], doc_id),
+         impact_151 = str_count(reports1$content[6], doc_id),
+         impact_161 = str_count(reports1$content[7], doc_id),
+         impact_171 = str_count(reports1$content[8], doc_id),
+         impact_181 = str_count(reports1$content[9], doc_id),
+         impact_191 = str_count(reports1$content[10], doc_id)) 
+
+# only two hits
+# cdr2204-2012_00_00_tra_res_en
+# cdr3765-2013_00_00_tra_ac_en
+
+
+impact_doc_id <- text1 %>% 
+  left_join(docsDF, by = c("document" = "docID")) %>% select(1, 8:10) %>% 
+  mutate(docTitle = ifelse(document == "cor-2018-01019-00-00-ac-tra-en", 
+                           "Contribution of EU local and regional authorities to the 14th meeting of the Conference of the Parties to the Convention on Biological Diversity (CBD)", docTitle),
+         doc_id = str_remove_all(document, "^r_") %>%
+           str_remove_all("_.*") %>% 
+           str_replace_all("cdr", "CdR ") %>% 
+           str_replace_all("\\-", "\\/"),
+         impact_101 = str_count(reports1$content[1], doc_id),
+         impact_111 = str_count(reports1$content_11[2], doc_id),
+         impact_121 = str_count(reports1$content[3], doc_id),
+         impact_131 = str_count(reports1$content[4], doc_id),
+         impact_141 = str_count(reports1$content[5], doc_id),
+         impact_151 = str_count(reports1$content[6], doc_id),
+         impact_161 = str_count(reports1$content[7], doc_id),
+         impact_171 = str_count(reports1$content[8], doc_id),
+         impact_181 = str_count(reports1$content[9], doc_id),
+         impact_191 = str_count(reports1$content[10], doc_id))
+```
+
+
+Since 2015, European Commissions provides follow-ups on CoR opinions. We downloaded these documents manually and put them in a sub-directory. To use them as an additional measurement of impact, we import them from this directory.
+
+```{r}
+ec_up <- read_dir(here("docs/follow_ups")) %>% 
+  group_by(document) %>% 
+  summarise_all(~ str_c(., sep = "", collapse = " "))
+```
+
+We prepare the data by dividing it into sections that correspond to opinions, and count the words:
+
+```{r}
+ec_up1 <- ec_up %>% 
+  mutate(content = content %>% str_replace_all("Nº", "N°") %>%
+           str_replace_all("N®", "N°") %>%
+           str_replace_all("N°ll", "N°11") %>% 
+           str_replace_all("N° 5", "N°5") %>%
+           str_replace_all("N° 8", "N°8") %>%
+           str_replace_all("N° 14", "N°14") %>%
+           str_replace_all("N° 23", "N°23") %>% 
+           str_replace_all("N°\n", "") %>% 
+           str_replace_all("N°910/2014", "N° 910/2014") %>%
+           str_remove_all("N° (?=\\d)") %>% 
+           str_replace_all("35/87 Digitalisation", "35/87 N°7 Digitalisation") %>% 
+           str_replace_all("26/71 |,^o3", "26/71 N°3") %>% 
+           str_replace_all("N'2", "N°2") %>% 
+           str_replace_all("75 N   A", "75 N°10   A") %>% 
+           str_replace_all("N' 0 7", "N°7") %>% 
+           str_replace_all("Reflecting on Europe:", "N°1 Reflecting on Europe:") %>% 
+           str_replace_all("N\\^", "N°") %>% 
+           str_replace_all("N'\\^IS", "N°18") %>% 
+           str_replace_all("1         EU reform", "N°1         EU reform") %>% 
+           str_replace_all("36 Asylum and Migration", "36 N°6 Asylum and Migration") %>% 
+           str_replace_all("jyojg", "N°15") %>% 
+           str_replace_all("N*\\^23", "N°23")) %>% 
+  summarise_all(~ str_split(., "(?=N°)")) %>%
+  unnest_longer(content) %>% 
+  filter(str_detect(content, "^N°\\d") == TRUE) %>% 
+  mutate(document = unlist(document),
+         wordcount = str_count(content,'\\w+'),
+         n_issue = str_extract(content, ".{4}") %>% trimws(),
+         n_doc = str_extract(document, ".{4}") %>% trimws(),
+         fup_id = str_glue("{n_doc}_{n_issue}")) %>% select(6,3,2)
+```
+
+Then we match the document ids to the results:
+
+```{r}
+ec_up2 <- ec_up1 %>% 
+  mutate(info = str_extract(content, "^(.*\\n.*\\n.*\\n.*\\n.*\\n.*\\n.*\\n.*\\n.*\\n.*)(\\n)") %>% 
+           str_remove(".{4}") %>% trimws()) %>% 
+  select(-3) %>% 
+  mutate(id = str_extract(info, regex("
+  (?:BUDG|CIVEX|COTER|DEVE|ECON|ECOS|EDUC|ENVE|NAT|RELEX|RESOL|SEDEC|GÜTER|ClVEX|CIVE\\ X|N\\ AT)
+  (\\s+)?         # optional whitespace
+  (?:-|\\/|\\—)?  # optional dash or slash or long dash
+  (\\s+)?         # optional whitespace
+  (?:IV|V|VI|VII|V1|VU|Vl|W|YI)?
+  (\\s+)?         # optional whitespace
+  (?:-|\\/|\\.)?  # optional dash or slash or dot
+  D?              # optional D (one case)
+  (\\d{2,3})      # two or three numbers
+  ", comments = TRUE)),
+  id_clean = id %>% str_replace_all("\\/", "\\-") %>% 
+    str_replace_all("-\\s+", "-") %>% 
+    str_replace_all("\\s+\\-", "-")%>%
+    str_replace_all("—", "-") %>% 
+    str_replace_all("\\.", "-") %>%
+    str_replace_all("GÜTER", "COTER") %>% 
+    str_replace_all("ClVEX", "CIVEX") %>% 
+    str_replace_all("CIVE\\ X", "CIVEX") %>% 
+    str_replace_all("N\\ AT", "NAT") %>% 
+    str_replace_all("V1", "VI") %>% 
+    str_replace_all("VU", "VI-") %>% 
+    str_replace_all("Vl", "VI") %>% 
+    str_replace_all("W", "VI") %>% 
+    str_replace_all("YI", "VI") %>%
+    str_replace_all("\\s+", "-") %>%
+    str_replace_all("D50", "050") %>%
+    str_replace_all("ENVE-VI10", "ENVE-VI-003") %>%
+    str_replace_all("COTER-VI-42", "COTER-VI-042") %>%
+    str_replace_all("CIVEX-21", "CIVEX-VI-021") %>%
+    if_else(is.na(.), "SEDEC-VI-012", .))
+```
+
+Some opinions receive follow-ups multiple times. We collapse these to one line each, and calculate the sum of wordcounts:
+
+```{r}
+ec_up3 <- ec_up2 %>%
+    group_by(id_clean) %>% 
+    filter(n()>1) %>% 
+    summarise(fup_id = fup_id[1], 
+              info = info[1], 
+              id = id[1], 
+              wordcount = sum(wordcount)) %>%
+    bind_rows(ec_up2 %>% 
+                  group_by(id_clean) %>% 
+                  filter(n()<2) %>% ungroup())
+```
+
+
+Next, we use the minutes of plenary sessions to extract further information. We search the web API of CoR for the term "plenary session" in document titles, specify document type as "PV", in the period between 1/1/2010 and 31/12/2021. There are 248 results (search done on 19/05/2022.
+
+We use the html source file of this search result to access and process the documents
+
+```{r}
+minutes_list <- readLines(here("data/input/minutes2010to2021html.txt"), encoding="UTF-8")
+
+minutes <- tibble(
+    doc_id = str_match(minutes_list, '(?<=class="metadata">)(.*?)(?=.doc)')[,2], 
+    title = str_match(minutes_list, '.*class="subheader documenttitle wrap".*?>(.*?)(?=</a>)')[,2], 
+    url = str_match(minutes_list, '(?<=href=")(.*?)(?=")')[,2], 
+    date_minutes = str_match(minutes_list, '.*?class="metadata">Produced\\s*(.*?)\\s*(?=</)')[,2] %>% dmy()
+)
+
+minutes <- cbind(minutes, date_minutes)
+```
+
+We use the URLs from above to download the minutes in pdf format.
+
+```{r}
+pdf_id <- glue("{minutes$doc_id}.pdf")
+dir.create(here("docs/minutes"))
+pdf_id <- paste0(here("docs/minutes"), "/", pdf_id)
+
+pdf_url <- minutes$url %>% 
+  str_replace_all("content", "pdf") %>% 
+  str_replace_all("COR", "cor")
+
+safe_download <- safely(~ download.file(.x , .y, mode = "wb"))
+walk2(pdf_url, pdf_id, safe_download)
+
+```
+
+We import the content of the pdf files and map each to a row. A few documents are missing and/or cannot be imported (on 22/05/2022, we added three documents manually to the directory):
+
+* cor-2018-01081-00-00-pv-tra-en
+* cor-2017-05752-00-01-pv-tra-en
+* cor-2018-01081-00-00-pv-tra-en
+
+```{r}
+text_minutes <- read_dir(here("docs/minutes")) %>% 
+  group_by(document) %>% 
+  summarise_all(~ str_c(., sep = "\n\n", collapse = "\n\n"))
+
+#save(text_minutes, file = "text_minutes.RData")
+#load("text_minutes.RData")
+```
+
+
+We filter out appendices, annexes, attendance lists etc. Then we check if any of the sessions are missing.
+
+```{r}
+minutes1 <- minutes %>% 
+  filter(!str_detect(title, "A(?:pp|PP|nn|tt)"),
+         !str_detect(title, "ARLEM"),
+         !str_detect(title, "Highlights"),
+         !str_detect(title, "Debate"),
+         !str_detect(title, "STATEMENT")) %>% 
+  left_join(text_minutes, by = c("doc_id" = "document")) %>% 
+  mutate(n_session = content %>% 
+           str_extract("(?<=MINUTES OF THE )\\d{2,3}(?:st|nd|rd|th)") %>% 
+           str_extract("\\d{2,3}") %>% 
+           as.numeric()) %>%
+    arrange(n_session) 
+minutes1 %>% complete(n_session=83:140) %>% filter(is.na(doc_id))
+
+
+```
+
+
+Missing documents are manually downloaded from the following links and added to a separate directory:
+106th: https://memportal.cor.europa.eu/Public/Documents/MeetingDocuments?meetingId=2092999&meetingSessionId=2113795
+107th: https://memportal.cor.europa.eu/Public/Documents/MeetingDocuments?meetingId=2093001&meetingSessionId=2113798
+108th: https://memportal.cor.europa.eu/Public/Documents/MeetingDocuments?meetingId=2093006&meetingSessionId=2113805
+109th: https://memportal.cor.europa.eu/Public/Documents/MeetingDocuments?meetingId=2107615&meetingSessionId=2132531
+111th: https://memportal.cor.europa.eu/Public/Documents/MeetingDocuments?meetingId=2103916&meetingSessionId=2127633
+112th: https://memportal.cor.europa.eu/Public/Documents/MeetingDocuments?meetingId=2103917&meetingSessionId=2127636
+114th: https://memportal.cor.europa.eu/Public/Documents/MeetingDocuments?meetingId=2103941&meetingSessionId=2127670
+115th: https://memportal.cor.europa.eu/Public/Documents/MeetingDocuments?meetingId=2117528&meetingSessionId=2145101
+117th: https://memportal.cor.europa.eu/Public/Documents/MeetingDocuments?meetingId=2118705&meetingSessionId=2146651
+
+```{r}
+minutes_man <- read_dir(here("docs/minutes/manual_download")) %>% 
+  group_by(document) %>% 
+  summarise_all(~ str_c(., sep = "\n\n", collapse = "\n\n")) %>% 
+  mutate(doc_id = document,
+         title = NA_character_,
+         url = NA_character_,
+         date_minutes = NA_Date_) %>% 
+  mutate(n_session = content %>% 
+           str_extract("(?<=MINUTES OF THE )\\d{2,3}(?:st|nd|rd|th)") %>% 
+           str_extract("\\d{2,3}") %>% 
+           as.numeric()) %>% 
+  select(-1)
+
+#save(minutes_man, file = "text_minutes_man.RData")
+#load("text_minutes_man.RData")
+```
+
+
+We turn these into a single dataset with the following steps:
+
+* Combine the datasets with automatically downloaded and manually downloaded minutes
+* Adjust content in exceptional cases to facilitate split between points of orders
+* Unnest dataset so every point of order is one observation 
+* Extract ID of procedure to identify which points of order tackle the opinions and resolutions 
+* Extract information on majority vs. unanimity and voting patterns where available 
+* Filter out duplicates
+
+```{r}
+minutes2 <- minutes1 %>% 
+  bind_rows(minutes_man) %>% 
+  mutate(content = content %>% 
+           str_replace("\n\n      13. Notification procedures", "\n\n13. Notification procedures") %>% 
+           str_replace("\n\n      16. Cross-border dimension", "\n\n16. Cross-border dimension") %>% 
+           str_replace("\n\n      18. Multilevel governance", "\n\n18. Multilevel governance") %>% 
+           str_replace("\n\n        Guidelines for the Employment", "\n\n5. Guidelines for the Employment") %>% 
+           str_replace("\n\n        Better protecting the marine", "\n\n6. Better protecting the marine") %>% 
+           str_replace("\n\n        A decent Life for all:", "\n\n7. A decent Life for all:") %>% 
+           str_replace("\n\n          Local and regional support", "\n\n8. Local and regional support") %>% 
+           str_replace("\n\n          Resolution on the European Committee of the Regions priorities", "\n\n9. Resolution on the European Committee of the Regions priorities") %>% 
+           str_replace("\n\n        Resolution for a sustainable EU approach to migration", "\n\n11. Resolution for a sustainable EU approach to migration"),
+         poo_text = content %>% str_split("(?=\\n\\n\\d+\\.\\s+)")) %>% 
+  unnest(poo_text, keep_empty = TRUE) %>% 
+  mutate(point_of_order = poo_text %>% str_extract_all("\\n\\n\\d+\\.\\s+") %>% as.numeric()) %>% 
+  select(-c(2:5)) %>% 
+  mutate(id = str_extract_all(poo_text, regex("
+  (?:BUDG|CIVEX|COTER|DEVE|ECON|ECOS|EDUC|ENVE|NAT|RELEX|RESOL|SEDEC)
+  (\\s+)?         # optional whitespace
+  (?:-|\\/)?  # optional dash or slash or long dash
+  (\\s+)?         # optional whitespace
+  (?:IV|V|VI|VII)?
+  (\\s+)?         # optional whitespace
+  (?:-|\\/)?  # optional dash or slash or dot
+  (\\d{2,3})      # two or three numbers
+  ", comments = TRUE))) %>% 
+  unnest(id, keep_empty = TRUE) %>% 
+  mutate(id_clean = id %>% str_replace_all("\\/", "\\-") %>% 
+    str_replace_all("\\s+", ""),
+    id_clean = case_when(n_session == 84 & point_of_order == 13 ~ "RESOL-?-001",
+                         n_session == 89 & point_of_order == 15 ~ "RESOL-?-003",
+                         n_session == 90 & point_of_order == 10 ~ "RESOL-?-004",
+                         n_session == 85 & point_of_order == 12 ~ "RESOL-?-005",
+                         n_session == 85 & point_of_order == 13 ~ "RESOL-?-006",
+                         n_session == 92 & point_of_order == 15 ~ "RESOL-?-007",
+                         n_session == 86 & point_of_order == 17 ~ "RESOL-?-008",
+                         n_session == 87 & point_of_order == 16 ~ "RESOL-?-010",
+                         n_session == 93 & point_of_order == 13 ~ "RESOL-?-011",
+                         n_session == 86 & point_of_order == 12 ~ "RECOM-?-001",
+                         n_session == 89 & point_of_order == 8 ~ "OP-?-001",
+                         n_session == 100 & point_of_order == 13 ~ "RESOL-V-005",
+                         n_session == 102 & point_of_order == 15 ~ "RESOL-V-006",
+                         n_session == 102 & point_of_order == 16 ~ "RESOL-V-007",
+                         n_session == 109 & point_of_order == 16 ~ "RESOL-V-016",
+                         n_session == 129 & point_of_order == 14 ~ "RESOL-VI-031",
+                         TRUE ~ id_clean),
+    result = poo_text %>% str_extract_all("(?<=After(?: the | )debate(?:, | )the).*") %>% 
+      trimws() %>% if_else(. == "character(0)", NA_character_, .),
+    type = str_extract(result, "\\w+") %>% if_else(id_clean == "RECOM-?-001", "recommendation", .) %>% 
+      if_else(is.na(.) & str_detect(id_clean, "RESOL"), "resolution", .) %>% 
+      if_else(is.na(.) & !str_detect(id_clean, "RESOL"), "opinion", .),
+    maj_un = case_when(str_detect(poo_text, "unanimously") ~ "unanimously",
+                       str_detect(poo_text, "unanimity") ~ "unanimously",
+                       str_detect(poo_text, "majority") ~ "majority"),
+    v_favour = str_extract(result, "(?<=votes in favour\\: )\\d+") %>% as.numeric(),
+    v_abstention1 = str_extract(result, "(?<=abstentions\\: )\\d+") %>% as.numeric(),
+    v_abstention2 = str_extract(result, "(?:1|2|3|one|two|three) abstention") %>% 
+      str_remove("abstention") %>% str_replace("one", "1") %>% 
+      str_replace("two", "2") %>% str_replace("three", "3") %>% as.numeric(),
+    v_abstention = ifelse(is.na(v_abstention1) & !is.na(v_abstention2), v_abstention2, v_abstention1),
+    v_against = str_extract(result, "(?<=against\\: )\\d+") %>% as.numeric()) %>% 
+  filter(!c(is.na(id_clean) & is.na(result)),
+         !c(n_session == 133 & id_clean == "NAT-VI-041"),
+         !c(n_session == 112 & id_clean == "RESOL-VI-003"),
+         !c(n_session == 140 & id_clean == "CIVEX-VII-002"),
+         !c(n_session == 94 & id_clean == "NAT-V-014"),
+         !c(n_session == 131 & point_of_order == 3)) %>% 
+  select(1:2, 4, 6, 8:10, 13:14)
+```
+
+
+We join the dataset from minutes with the dataset of opinions and resolutions. Information from minutes is missing for several documents and there are several items cannot be identified. These should be checked later.
+
+```{r}
+plenary_results <- text1 %>% select(1,9) %>% 
+  left_join(minutes2, by = "id_clean")
+```
+
+
+There are several types of amendments:
+
+* AMC: commission amendments
+* AMRC: rapporteur commission amendments
+* AMP: plenary amendments
+* AMRP: rapporteur plenary amendments
+* AM: amendments in old format
+* AMR: rapporteur amendments in old format
+
+We search for these document types on https://dmsearch.cor.europa.eu/search/public, for the period between 1/1/2010 and 31/12/2021. We use the combined source html file of the search results to extract the main information. There are 2942 documents in total.
+
+```{r}
+ams_list <- readLines(here("data/input/AMall2010to2021html.txt"), encoding="UTF-8")
+
+ams <- tibble(
+    doc_id = str_match(ams_list, '(?<=class="metadata">)(.*?)(?=.doc)')[,2], 
+    title = str_match(ams_list, '.*class="subheader documenttitle wrap".*?>(.*?)(?=</a>)')[,2], 
+    url = str_match(ams_list, '(?<=href=")(.*?)(?=")')[,2], 
+    date_ams = str_match(ams_list, '.*?class="metadata">Produced\\s*(.*?)\\s*(?=</)')[,2] %>% dmy(),
+    type = str_match(ams_list, '(?<=Type <strong _ngcontent-tog-c124="">)(.*?)(?=</strong>)')[,2]
+)
+```
+
+We use the URLs from above to download the amendment documents. One document is missing (manually checked, it is not available on the database "cdr342-2010_am13r+_am23r_am_en").
+
+```{r}
+pdf_id <- glue("{ams$doc_id}.pdf")
+dir.create(here("docs/amendments"))
+pdf_id <- paste0(here("docs/amendments"), "/", pdf_id)
+pdf_url <- ams$url %>% 
+  str_replace_all("content", "pdf") %>% 
+  str_replace_all("COR", "cor")
+
+safe_download <- safely(~ download.file(.x , .y, mode = "wb"))
+walk2(pdf_url, pdf_id, safe_download)
+```
+
+
+Then we import the content of the amendments.
+
+```{r}
+text_ams <- read_dir(here("docs/amendments")) %>% 
+  group_by(document) %>% 
+  summarise_all(~ str_c(., sep = "\n\n", collapse = "\n\n"))
+
+#save(text_ams, file = "text_ams.RData")
+#load("text_ams.RData")
+```
+
+
+We combine the main information about the amendments and the content of documents, then calculate the number of amendments by type and in total.
+
+```{r}
+text_ams2 <- text_ams %>% left_join(ams, by = c("document" = "doc_id")) %>% 
+  mutate(id = str_extract(content, regex("
+  (?:BUDG|CIVEX|COTER|DEVE|ECON|ECOS|EDUC|ENVE|NAT|RELEX|RESOL|SEDEC)
+  (\\s+)?         # optional whitespace
+  (?:-|\\/)?  # optional dash or slash or long dash
+  (\\s+)?         # optional whitespace
+  (?:IV|V|VI|VII)?
+  (\\s+)?         # optional whitespace
+  (?:-|\\/)?  # optional dash or slash or dot
+  (\\d{2,3})      # two or three numbers
+  ", comments = TRUE)) %>%
+    str_replace_all("\\/", "-"),
+  ams = str_split(content, "AMENDMENT \\d+"),
+  id_clean = case_when(document == "cdr101-2010_am1-18_am_en" ~ "RESOL-?-001",
+                       document == "cdr123-2011_am1-12_am_en" ~ "RESOL-?-003",
+                       document == "cdr137-2010_am_1-33_am_en" ~ "RECOM-?-001",
+                       document == "cdr137-2010_am1-33_rev1_am_en" ~ "RECOM-?-001",
+                       document == "cdr137-2010_rev3_am_1-14_am_en" ~ "RECOM-?-001",
+                       document == "cdr156-2011_am1-13_am_en" ~ "RESOL-?-004",  
+                       document == "cdr175-2010_am_1-17_am_en" ~ "RESOL-?-005",
+                       document == "cdr199-2010_rev1_am_1-11_am_en" ~ "RESOL-?-006",
+                       document == "cdr269-2011_am1a16_am_en" ~ "RESOL-?-007",
+                       document == "cdr284-2010_am_1-7_am_en" ~ "RESOL-?-008",
+                       document == "cdr318-2010_rev1_am_1-95_am_en" ~ "OP-?-001",
+                       document == "cdr318-2010_rev1_am7r_am16r_etc_am_en" ~ "OP-?-001",
+                       document == "cdr318-2010_rev2_am_1-73_am_en" ~ "OP-?-001",
+                       document == "cdr318-2010_rev2_am_11r-28r-32r-37r-44r-_am_en" ~ "OP-?-001",
+                       document == "cdr361-2010_am_1-19_am_en" ~ "RESOL-?-010",
+                       document == "cor-2014-00536-00-00-amp-tra-en" ~ "RESOL-V-010",
+                       TRUE ~ id)) %>% 
+  unnest(ams) %>% 
+  select(-c(2,8)) 
+
+n_ams_total <- text_ams2 %>% 
+  group_by(id_clean) %>% 
+  mutate(n_ams_total = row_number()) %>%
+  slice_max(n_ams_total) %>% ungroup() %>% select(7, 8)
+
+n_ams_amc <- text_ams2 %>% filter(type == "AMC") %>% 
+  group_by(id_clean) %>% 
+  mutate(n_ams_amc = row_number()) %>%
+  slice_max(n_ams_amc) %>% ungroup() %>% select(7, 8)
+
+n_ams_amrc <- text_ams2 %>% filter(type == "AMRC") %>% 
+  group_by(id_clean) %>% 
+  mutate(n_ams_amrc = row_number()) %>%
+  slice_max(n_ams_amrc) %>% ungroup() %>% select(7, 8)
+
+n_ams_amp <- text_ams2 %>% filter(type == "AMP") %>% 
+  group_by(id_clean) %>% 
+  mutate(n_ams_amp = row_number()) %>%
+  slice_max(n_ams_amp) %>% ungroup() %>% select(7, 8)
+
+n_ams_amrp <- text_ams2 %>% filter(type == "AMRP") %>% 
+  group_by(id_clean) %>% 
+  mutate(n_ams_amrp = row_number()) %>%
+  slice_max(n_ams_amrp) %>% ungroup() %>% select(7, 8)
+
+n_ams_am <- text_ams2 %>% filter(type == "AM") %>% 
+  group_by(id_clean) %>% 
+  mutate(n_ams_am = row_number()) %>%
+  slice_max(n_ams_am) %>% ungroup() %>% select(7, 8)
+
+n_ams_amr <- text_ams2 %>% filter(type == "AMR") %>% 
+  group_by(id_clean) %>% 
+  mutate(n_ams_amr = row_number()) %>%
+  slice_max(n_ams_amr) %>% ungroup() %>% select(7, 8)
+
+n_ams <- n_ams_total %>% left_join(n_ams_amc, by = "id_clean") %>% 
+  left_join(n_ams_amrc, by = "id_clean") %>% 
+  left_join(n_ams_amp, by = "id_clean") %>% 
+  left_join(n_ams_amrp, by = "id_clean") %>% 
+  left_join(n_ams_am, by = "id_clean") %>% 
+  left_join(n_ams_amr, by = "id_clean")
+```
+
+At this stage, we extracted all the information that we need from the documents. Now we bring together these into a single dataset for further analysis.
+
+First, we create total impact metrics for each type of impact checked:
+
+```{r}
+impact_doc_id$impact_doc_id_all <- rowSums(impact_doc_id[6:15])
+impact_doc_id_old$impact_doc_id_old_all <- rowSums(impact_doc_id_old[6:15])
+impact_id$impact_id_all <- rowSums(impact_id[5:14])
+impact_id_old$impact_id_old_all <- rowSums(impact_id_old[4:13])
+impact_id_sd$impact_id_sd_all <- impact_id_sd$impact
+impact_title$impact_title_all <- impact_title$impact
+impact_title_old$impact_title_old_all <- rowSums(impact_title_old[4:13])
+```
+
+Next, combine these into a single dataset, calculate max and sum values
+
+```{r}
+impact_df <- select(impact_doc_id, document, id, id_clean, impact_doc_id_all) %>%
+  left_join(select(impact_doc_id_old, document, impact_doc_id_old_all), by="document") %>% 
+  left_join(select(impact_id, document, impact_id_all), by="document") %>%
+  left_join(select(impact_id_old, document, impact_id_old_all), by="document") %>% 
+  left_join(select(impact_id_sd, document, impact_id_sd_all), by="document") %>% 
+  left_join(select(impact_title, document, impact_title_all), by="document") %>% 
+  left_join(select(impact_title_old, document, impact_title_old_all), by="document") %>% 
+  mutate(doc_id_max = pmax(impact_doc_id_all, impact_doc_id_old_all), 
+         id_max = pmax(impact_id_all, impact_id_old_all, impact_id_sd_all), 
+         title_max = pmax(impact_title_all, impact_title_old_all)) %>% 
+  mutate(impact_max = pmax(doc_id_max, id_max, title_max), 
+         impact_sum = doc_id_max + id_max + title_max)
+  
+```
+
+We create a dataset of opinions and resolutions, since we have information for both from other documents.
+
+```{r}
+ops_res <- bind_rows(opinions, resolutions)
+```
+
+And we combine all relevant variables into single dataset
+
+```{r}
+full_df <- docsDF %>%
+  select(document = docID, doc_title = docTitle, doc_url = docURL, doc_type = docType,
+         com_term = commission, com_name = commissionSimple, 
+         adop_date = adopDate, adop_year = adopYear) %>% 
+  left_join(select(ops_res, -proc_basis, -co_raps, -vote_com_clean), by="document") %>%
+  filter(!is.na(id_clean)) %>% 
+  rename(text_wordcount = wordcount, rap_name = rapporteur, rap_party = party, 
+         rap_ctr = country, rap_occ = occupation, rap_lr = loc_reg, com_vote = vote_all_clean) %>% 
+  left_join(select(ec_up3, fup_wordcount = wordcount, id_clean), by="id_clean") %>%
+  left_join(select(plenary_results, document, plen_vote = maj_un), by="document") %>% 
+  left_join(select(n_ams, id_clean, n_ams_total), by="id_clean") %>% 
+  left_join(select(impact_df, document, impact_max, impact_sum), by="document") %>%
+  relocate(com_id = id_clean, .before = com_term) %>%
+  relocate(rap_name, rap_party, rap_ctr, rap_occ, rap_lr, .after = adop_year) %>% 
+  mutate(fup_mention = ifelse(is.na(fup_wordcount), 'no', 'yes')) %>% 
+  mutate(fup_wordcount = ifelse(is.na(fup_wordcount), 0, fup_wordcount)) %>% 
+  mutate(imp_mention = ifelse(impact_sum > 0, 'yes', 'no')) %>% 
+  relocate(fup_wordcount, fup_mention, .after = last_col()) %>% 
+  mutate(n_ams_rel = n_ams_total / n_articles_total) %>% 
+  relocate(n_ams_rel, .after = n_ams_total) %>% 
+  mutate(fup_rel = fup_wordcount / text_wordcount) %>% 
+  select(-c("rap", "id", "vote"))
+
+#save(full_df, file="cor_docs_full.rdata")
+
+```
+
+Subset again to opinions
+```{r}
+df_ops <- full_df %>% filter(doc_type == "AC")
+```
+
+Explore data
+```{r}
+glimpse(df_ops)
+df_ops <- df_ops %>%
+  mutate(adop_year = factor(adop_year), 
+         rap_party = ifelse(rap_party=='ALDE' | rap_party=='RE', 'ALDE-RE', rap_party),
+         rap_party = factor(rap_party), 
+         rap_ctr = factor(rap_ctr), 
+         rap_lr = factor(rap_lr), 
+         n_articles = as.integer(n_articles), 
+         n_articles_total = as.integer(n_articles_total), 
+         com_vote = factor(com_vote), 
+         plen_vote = factor(plen_vote), 
+         plen_vote = fct_recode(plen_vote, unanimity = "unanimously"),
+         impact_max = as.integer(impact_max), 
+         impact_sum = as.integer(impact_sum), 
+         imp_mention = factor(imp_mention), 
+         fup_wordcount = as.integer(fup_wordcount), 
+         fup_mention = factor(fup_mention), 
+         com_name = fct_recode(com_name, OTHER="OTHER", OTHER="DEVE", OTHER="RELEX"))
+skim(df_ops)
+```
+
+What explains internal results?
+```{r}
+df_ops %>%
+  group_by(com_name) %>% 
+  summarise(m=mean(n_ams_rel, na.rm = TRUE)) %>%
+  arrange(m)
+
+df_ops <- df_ops %>% 
+  mutate(com_name_educ = fct_relevel(com_name, "EDUC", after=0), 
+         com_name_civex = fct_relevel(com_name, "CIVEX", after=0))
+
+df_ops %>%
+  group_by(rap_party) %>% 
+  summarise(m=mean(n_ams_rel, na.rm = TRUE)) %>%
+  arrange(m)
+
+df_ops <- df_ops %>% 
+  mutate(rap_party_EA = fct_relevel(rap_party, "EA", after=0), 
+         rap_party_EPP = fct_relevel(rap_party, "EPP", after=0))
+
+df_ops %>%
+  group_by(rap_lr) %>% 
+  summarise(mean(n_ams_rel, na.rm = TRUE))
+
+df_ops %>%
+  group_by(com_name, plen_vote) %>% 
+  summarise(n=n()) %>% 
+  spread(plen_vote, n) %>% 
+  mutate(prop = unanimity / majority) %>%
+  arrange(prop)
+
+df_ops <- df_ops %>% 
+  mutate(com_name_ecos = fct_relevel(com_name, "ECOS", after=0))
+
+df_ops %>%
+  group_by(rap_party, plen_vote) %>% 
+  summarise(n=n()) %>% 
+  spread(plen_vote, n) %>% 
+  mutate(prop = unanimity / majority) %>% 
+  arrange(prop)
+
+df_ops %>%
+  group_by(rap_lr, plen_vote) %>% 
+  summarise(n=n()) %>% 
+  spread(plen_vote, n) %>% 
+  mutate(prop = unanimity / majority)
+
+lm(log(n_ams_rel) ~ 
+     com_name_civex + rap_party_EPP + rap_lr, 
+   data=df_ops) %>%
+  summary()
+
+glm(plen_vote ~ 
+      com_name_ecos + rap_party_EPP + rap_lr, 
+    family=binomial(link='logit'), data=df_ops) %>% 
+  summary()
+```
+
+What explains impact assessment and follow-ups?
+```{r}
+df_ops %>% 
+  group_by(com_name) %>% 
+  summarise(m=mean(impact_sum, na.rm=TRUE)) %>%
+  arrange(m)
+
+df_ops <- df_ops %>%
+  mutate(com_name_budg = fct_relevel(com_name, "BUDG", after=0))
+
+df_ops %>% 
+  group_by(rap_party) %>% 
+  summarise(m=mean(impact_sum, na.rm=TRUE)) %>%
+  arrange(m)
+
+df_ops %>% 
+  group_by(rap_lr) %>% 
+  summarise(m=mean(impact_sum, na.rm=TRUE)) %>%
+  arrange(m)
+
+df_ops %>% 
+  group_by(plen_vote) %>% 
+  summarise(m=mean(impact_sum, na.rm=TRUE)) %>%
+  arrange(m)
+
+df_ops %>% 
+  group_by(com_name, imp_mention) %>% 
+  summarise(n=n()) %>%
+  spread(imp_mention, n) %>% 
+  mutate(prop = no / yes) %>%
+  arrange(prop)
+
+df_ops %>% 
+  group_by(rap_party, imp_mention) %>% 
+  summarise(n=n()) %>%
+  spread(imp_mention, n) %>% 
+  mutate(prop = no / yes) %>%
+  arrange(prop)
+
+df_ops %>% 
+  group_by(com_name) %>% 
+  summarise(m=mean(fup_wordcount, na.rm=TRUE)) %>%
+  arrange(m)
+
+df_ops %>% 
+  group_by(rap_party) %>% 
+  summarise(m=mean(fup_rel, na.rm=TRUE)) %>%
+  arrange(m)
+
+df_ops20 <- df_ops %>% 
+  filter(adop_year!=2020)
+
+lm(log(fup_rel + 1) ~ 
+     com_name_civex + rap_party + rap_lr + log(n_ams_rel + 1), 
+   data=df_ops20) %>% 
+  summary()
+
+lm(log(impact_sum + 1) ~ 
+     com_name_budg + rap_party + log(n_ams_rel + 1), 
+   data=df_ops20) %>% 
+  summary()
+
+glm(imp_mention ~ 
+      com_name_ecos + rap_party + log(n_ams_rel + 1), 
+   family=binomial(link='logit'), data=df_ops20) %>% 
+  summary()
+
+glm(fup_mention ~ 
+      com_name_ecos + rap_party + log(n_ams_rel + 1), 
+   family=binomial(link='logit'), data=df_ops20) %>% 
+  summary()
+
+```
+
+
+
+
+
+
+
+
+
+
