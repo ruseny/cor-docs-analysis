@@ -8,3 +8,5 @@ The main notebook, written in R and formatted as R markdown, documents several p
 - Preliminary regression models to explore existing patterns
 
 The code base was created in collaboration with [David Steinecke](https://www.polver.uni-konstanz.de/en/leuffen/team/team-prof-dirk-leuffen/david-steinecke/)
+
+Note that the notebook is not fully functional without some additional documents, which are omitted due to storage limitations.
