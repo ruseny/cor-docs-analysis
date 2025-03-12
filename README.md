@@ -1,6 +1,6 @@
 # Analysis of Committee of the Regions Documents
 
-This is an unfinished project to extract data from Committee of the Regions douments, and conduct analyses on that dataset.
+This is an exercise to extract data from Committee of the Regions douments, and conduct analyses on that dataset.
 
 The main notebook, written in R and formatted as R markdown, documents several procedures of text processing and analysis:
 - Use of html source files of the online document search portal to automate file download (API not available)
